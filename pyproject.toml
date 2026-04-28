@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_spot"
+version = "0.0.1"
+description = "LeRobot Spot Integration"
+readme = "README.md"
+authors = [
+  { name = "Jonas Stehr"},
+]
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "bosdyn-client",
+  "bosdyn-mission",
+  "bosdyn-choreography-client",
+  "bosdyn-orbit",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lerobot_robot_spot*"]
+exclude = ["*.egg-info"]
