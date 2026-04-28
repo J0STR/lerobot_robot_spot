@@ -1,0 +1,8 @@
+.venv
+__pycache__/
+build/
+# ignore egg folders
+*.egg
+*.egg-info/
+.vscode
+login_data.py
