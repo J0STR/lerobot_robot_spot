@@ -8,15 +8,14 @@ import bosdyn.client
 import bosdyn.client.lease
 from bosdyn.client.lease import LeaseClient
 import bosdyn.client.util
-import bosdyn.geometry
-from bosdyn.api import trajectory_pb2
-from bosdyn.api.spot import robot_command_pb2 as spot_command_pb2
-from bosdyn.client import math_helpers
-from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME, ODOM_FRAME_NAME, get_a_tform_b
 from bosdyn.client.image import ImageClient
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
 from bosdyn.client.robot_state import RobotStateClient
+from scipy.spatial.transform import Rotation as R
+from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME
+from bosdyn.api import arm_command_pb2
 from bosdyn.util import seconds_to_duration
+
 
 import numpy as np
 import time
@@ -41,6 +40,7 @@ class Spot(Robot):
         self._is_connected = False
 
         self._VELOCITY_CMD_DURATION = 0.1
+        self._VELOCITY_CMD_DURATION_ARM = 0.5
     
     
     def connect(self, calibrate: bool = True) -> None:
@@ -94,18 +94,47 @@ class Spot(Robot):
         return obs_dict
     
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        goal_vel = {key.removesuffix(".vel"): val for key, val in action.items()}
-        action = goal_vel 
+        v_x = action.get("x_axis.vel", 0.0)
+        v_y = action.get("y_axis.vel", 0.0)
+        v_rot = action.get("rotation.vel", 0.0)
+        
+        base_command = RobotCommandBuilder.synchro_velocity_command(
+            v_x=v_x, v_y=v_y, v_rot=v_rot
+        )
 
-    
-        if goal_vel['x_axis'] != 0 or goal_vel['y_axis'] !=0 or goal_vel['rotation'] !=0:
-                command = RobotCommandBuilder.synchro_velocity_command(v_x=goal_vel['x_axis'],
-                                                                        v_y=goal_vel['y_axis'],
-                                                                        v_rot=goal_vel['rotation'])
-                end_time_secs=time.time() + self._VELOCITY_CMD_DURATION
-                self.robot_command_client.robot_command(command=command,
-                                                        end_time_secs=end_time_secs) 
-    
+        rpy = [action.get("arm.roll", 0.0), action.get("arm.pitch", 0.0), action.get("arm.yaw", 0.0)]
+        quat = R.from_euler('xyz', rpy).as_quat() # Returns [x, y, z, w]
+        
+        if action.get("arm_control"):
+            arm_command = RobotCommandBuilder.arm_pose_command(
+                action.get("arm.x", 0.3), # Default reach
+                action.get("arm.y", 0.0), 
+                action.get("arm.z", 0.0),
+                quat[3], quat[0], quat[1], quat[2], # Spot wants [w, x, y, z]
+                GRAV_ALIGNED_BODY_FRAME_NAME,
+                self._VELOCITY_CMD_DURATION_ARM
+            )
+
+            gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(
+                action.get("gripper.action", 0.0)
+            )
+
+            command = RobotCommandBuilder.build_synchro_command(
+                base_command, arm_command, gripper_command
+            )
+        else:
+            gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(
+                action.get("gripper.action", 0.0)
+            )      
+            command = RobotCommandBuilder.build_synchro_command(base_command,
+                                                                           gripper_command)
+
+        # 5. Send to Robot
+        end_time_secs = time.time() + self._VELOCITY_CMD_DURATION
+        self.robot_command_client.robot_command(
+            command=command,
+            end_time_secs=end_time_secs
+        )
 
         return action
 
@@ -130,6 +159,14 @@ class Spot(Robot):
             "x_axis.vel": float,
             "y_axis.vel": float,
             "rotation.vel": float,
+            "arm_control": bool,
+            "arm.x": float,
+            "arm.y": float,
+            "arm.z": float,
+            "arm.roll": float,
+            "arm.pitch": float,
+            "arm.yaw": float,
+            "gripper.action": float,
         }
 
     @property
