@@ -159,7 +159,6 @@ class Spot(Robot):
             "x_axis.vel": float,
             "y_axis.vel": float,
             "rotation.vel": float,
-            "arm_control": bool,
             "arm.x": float,
             "arm.y": float,
             "arm.z": float,
