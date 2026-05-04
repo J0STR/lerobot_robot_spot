@@ -12,13 +12,14 @@ from bosdyn.client.image import ImageClient
 from bosdyn.client.robot_command import RobotCommandBuilder, RobotCommandClient, blocking_stand
 from bosdyn.client.robot_state import RobotStateClient
 from scipy.spatial.transform import Rotation as R
-from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME
+from bosdyn.client.frame_helpers import GRAV_ALIGNED_BODY_FRAME_NAME, HAND_FRAME_NAME, get_a_tform_b
 from bosdyn.api import arm_command_pb2
 from bosdyn.util import seconds_to_duration
 
 
 import numpy as np
 import time
+import cv2
 
 class Spot(Robot):
     config_class = SpotConfig
@@ -46,7 +47,7 @@ class Spot(Robot):
         # Inside __init__
         self.last_arm_pose = {
             "x": 0.3, "y": 0.0, "z": 0.2,
-            "roll": 0.0, "pitch": 0.0, "yaw": 0.0 # yaw
+            "rot.w": 0.0,  "rot.x": 0.0, "rot.y": 0.0, "rot.z": 0.0
         }
         self.carry_mode = True
         self.carry_flipped = False
@@ -95,20 +96,77 @@ class Spot(Robot):
     def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
-        
-        self.robot_state = self.robot_state_client.get_robot_state()
+
+        obs_dict = {}
+
+        state = self.robot_state_client.get_robot_state()
         image_responses = self.image_client.get_image_from_sources(
             ['hand_color_image']
             )
+                
+        joint_states = state.kinematic_state.joint_states
 
-        obs_dict = {}
+        # Extract Arm Joints (sh0, sh1, el0, el1, wr0, wr1)
+        arm_joints = sorted(
+            [j for j in joint_states if j.name.startswith("arm0") and not j.name.endswith("f1x")],
+            key=lambda x: x.name
+        )
+        arm_joint_pos = np.array([j.position.value for j in arm_joints], dtype=np.float32)
+        arm_joint_vel = np.array([j.velocity.value for j in arm_joints], dtype=np.float32)
+        arm_joint_load = np.array([j.load.value for j in arm_joints], dtype=np.float32)
+        for i, angle in enumerate(arm_joint_pos):
+            obs_dict[f"arm.joint{i+1}.pos"]   = angle
+            obs_dict[f"arm.joint{i+1}.vel"]   = arm_joint_vel[i]
+            obs_dict[f"arm.joint{i+1}.load"]  = arm_joint_load[i]
+
+        
+        # Extract Gripper Joint (arm0.f1x)
+        gripper_joint = next((j for j in joint_states if j.name == "arm0.f1x"), None)
+        manipulator_state = state.manipulator_state     
+        obs_dict[f"gripper.pos"] = manipulator_state.gripper_open_percentage / 100.0
+        obs_dict[f"gripper.vel"] = gripper_joint.velocity.value
+        obs_dict[f"gripper.load"] = gripper_joint.load.value
+    
+        # Arm Pose
+        body_tform_hand = get_a_tform_b(
+            state.kinematic_state.transforms_snapshot,
+            GRAV_ALIGNED_BODY_FRAME_NAME,
+            HAND_FRAME_NAME
+        )
+        hand_pose = np.array([
+            body_tform_hand.x, body_tform_hand.y, body_tform_hand.z,
+            body_tform_hand.rot.w, body_tform_hand.rot.x, body_tform_hand.rot.y, body_tform_hand.rot.z
+        ], dtype=np.float32)
+        obs_dict["arm.x"] = body_tform_hand.x
+        obs_dict["arm.y"] = body_tform_hand.y
+        obs_dict["arm.z"] = body_tform_hand.z
+        obs_dict["arm.rot.w"] = body_tform_hand.rot.w
+        obs_dict["arm.rot.x"] = body_tform_hand.rot.x
+        obs_dict["arm.rot.y"] = body_tform_hand.rot.y
+        obs_dict["arm.rot.z"] = body_tform_hand.rot.z        
+        # Base
+        base_vel_linear = state.kinematic_state.velocity_of_body_in_vision.linear
+        base_vel_angular = state.kinematic_state.velocity_of_body_in_vision.angular
+        obs_dict["base.x.vel"] = base_vel_linear.x
+        obs_dict["base.y.vel"] = base_vel_linear.y
+        obs_dict["base.rot.vel"] = base_vel_angular.z
+
+        # images
+        for resp in image_responses:
+            if resp.source.name == 'hand_color_image':
+                dtype = np.uint8
+                img = cv2.imdecode(np.frombuffer(resp.shot.image.data, dtype=dtype), cv2.IMREAD_COLOR)
+                rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                obs_dict = {
+                    "images.gripper_cam" : rgb_img,
+                }
 
         return obs_dict
     
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        v_x = action.get("x_axis.vel", 0.0)
-        v_y = action.get("y_axis.vel", 0.0)
-        v_rot = action.get("rotation.vel", 0.0)
+        v_x = action.get("base.x.vel", 0.0)
+        v_y = action.get("base.y.vel", 0.0)
+        v_rot = action.get("base.rot.vel", 0.0)
 
         base_command = RobotCommandBuilder.synchro_velocity_command(
             v_x=v_x, v_y=v_y, v_rot=v_rot
@@ -126,35 +184,36 @@ class Spot(Robot):
             self.last_arm_pose["x"] = action.get("arm.x", self.last_arm_pose["x"])
             self.last_arm_pose["y"] = action.get("arm.y", self.last_arm_pose["y"])
             self.last_arm_pose["z"] = action.get("arm.z", self.last_arm_pose["z"])
-            self.last_arm_pose["roll"] = action.get("arm.roll", self.last_arm_pose["roll"])
-            self.last_arm_pose["pitch"] = action.get("arm.pitch", self.last_arm_pose["pitch"])
-            self.last_arm_pose["yaw"] = action.get("arm.yaw", self.last_arm_pose["yaw"])
-
-            rpy = [self.last_arm_pose["roll"], self.last_arm_pose["pitch"], self.last_arm_pose["yaw"]]
-            quat = R.from_euler('xyz', rpy).as_quat()
+            self.last_arm_pose["rot.w"] = action.get("arm.rot.w", self.last_arm_pose["rot.w"])
+            self.last_arm_pose["rot.x"] = action.get("arm.rot.x", self.last_arm_pose["rot.x"])
+            self.last_arm_pose["rot.y"] = action.get("arm.rot.y", self.last_arm_pose["rot.y"])
+            self.last_arm_pose["rot.z"] = action.get("arm.rot.z", self.last_arm_pose["rot.z"])
             
             arm_command = RobotCommandBuilder.arm_pose_command(
                 self.last_arm_pose["x"], self.last_arm_pose["y"], self.last_arm_pose["z"],
-                quat[3], quat[0], quat[1], quat[2], 
+                self.last_arm_pose["rot.w"], 
+                self.last_arm_pose["rot.x"], 
+                self.last_arm_pose["rot.y"], 
+                self.last_arm_pose["rot.z"], 
                 GRAV_ALIGNED_BODY_FRAME_NAME,
                 self._VELOCITY_CMD_DURATION_ARM
             )
         elif self.carry_mode:
             arm_command = RobotCommandBuilder.arm_carry_command()
-        else:
-            rpy = [self.last_arm_pose["roll"], self.last_arm_pose["pitch"], self.last_arm_pose["yaw"]]
-            quat = R.from_euler('xyz', rpy).as_quat()
-            
+        else:           
             arm_command = RobotCommandBuilder.arm_pose_command(
                 self.last_arm_pose["x"], self.last_arm_pose["y"], self.last_arm_pose["z"],
-                quat[3], quat[0], quat[1], quat[2], 
+                self.last_arm_pose["rot.w"], 
+                self.last_arm_pose["rot.x"], 
+                self.last_arm_pose["rot.y"], 
+                self.last_arm_pose["rot.z"],  
                 GRAV_ALIGNED_BODY_FRAME_NAME,
                 self._VELOCITY_CMD_DURATION_ARM
             )
 
 
         gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(
-            action.get("gripper.action", 0.0)
+            action.get("gripper.pos", 0.0)
         )
 
         command = RobotCommandBuilder.build_synchro_command(
@@ -167,8 +226,6 @@ class Spot(Robot):
             command=command,
             end_time_secs=end_time_secs
         )
-
-        self.carry_last_state = action.get("arm_carry_enabled")
 
         return action
 
@@ -190,16 +247,23 @@ class Spot(Robot):
     @property
     def _motors_ft(self) -> dict[str, type]:
         return {
-            "x_axis.vel": float,
-            "y_axis.vel": float,
-            "rotation.vel": float,
+            "base.x.vel": float,
+            "base.x.vel": float,
+            "base.rot.vel": float,
+            "arm.joint1.pos": float,
+            "arm.joint2.pos": float,
+            "arm.joint3.pos": float,
+            "arm.joint4.pos": float,
+            "arm.joint5.pos": float,
+            "arm.joint6.pos": float,           
             "arm.x": float,
             "arm.y": float,
             "arm.z": float,
-            "arm.roll": float,
-            "arm.pitch": float,
-            "arm.yaw": float,
-            "gripper.action": float,
+            "arm.rot.w": float,
+            "arm.rot.x": float,
+            "arm.rot.y": float,
+            "arm.rot.z": float,
+            "gripper.pos": float,            
         }
 
     @property
