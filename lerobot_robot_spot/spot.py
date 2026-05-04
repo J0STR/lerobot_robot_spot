@@ -34,13 +34,20 @@ class Spot(Robot):
         self.robot_state_client: RobotStateClient
         self.robot_command_client: RobotCommandClient
         self.lease_client: LeaseClient
+        self.image_client: ImageClient
         self.robot_state = None
         
         self._lease_keepalive = None
         self._is_connected = False
 
         self._VELOCITY_CMD_DURATION = 0.1
-        self._VELOCITY_CMD_DURATION_ARM = 0.5
+        self._VELOCITY_CMD_DURATION_ARM = 0.1
+
+        # Inside __init__
+        self.last_arm_pose = {
+            "x": 0.3, "y": 0.0, "z": 0.2,
+            "roll": 0.0, "pitch": 0.0, "yaw": 0.0 # yaw
+        }
     
     
     def connect(self, calibrate: bool = True) -> None:
@@ -60,6 +67,7 @@ class Spot(Robot):
         self.robot_state_client     = self.robot.ensure_client(RobotStateClient.default_service_name)
         self.robot_command_client   = self.robot.ensure_client(RobotCommandClient.default_service_name)
         self.lease_client           = self.robot.ensure_client(LeaseClient.default_service_name)
+        self.image_client           = self.robot.ensure_client(ImageClient.default_service_name)
         self.robot_state = self.robot_state_client.get_robot_state()
 
         self._lease_keepalive = bosdyn.client.lease.LeaseKeepAlive(
@@ -86,8 +94,10 @@ class Spot(Robot):
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
         
-     
         self.robot_state = self.robot_state_client.get_robot_state()
+        image_responses = self.image_client.get_image_from_sources(
+            ['hand_color_image']
+            )
 
         obs_dict = {}
 
@@ -97,41 +107,45 @@ class Spot(Robot):
         v_x = action.get("x_axis.vel", 0.0)
         v_y = action.get("y_axis.vel", 0.0)
         v_rot = action.get("rotation.vel", 0.0)
-        
+
         base_command = RobotCommandBuilder.synchro_velocity_command(
             v_x=v_x, v_y=v_y, v_rot=v_rot
         )
-
-        rpy = [action.get("arm.roll", 0.0), action.get("arm.pitch", 0.0), action.get("arm.yaw", 0.0)]
-        quat = R.from_euler('xyz', rpy).as_quat() # Returns [x, y, z, w]
         
         if action.get("arm_control"):
+            # Update last known pose
+            self.last_arm_pose["x"] = action.get("arm.x", self.last_arm_pose["x"])
+            self.last_arm_pose["y"] = action.get("arm.y", self.last_arm_pose["y"])
+            self.last_arm_pose["z"] = action.get("arm.z", self.last_arm_pose["z"])
+            self.last_arm_pose["roll"] = action.get("arm.roll", self.last_arm_pose["roll"])
+            self.last_arm_pose["pitch"] = action.get("arm.pitch", self.last_arm_pose["pitch"])
+            self.last_arm_pose["yaw"] = action.get("arm.yaw", self.last_arm_pose["yaw"])
+
+            rpy = [self.last_arm_pose["roll"], self.last_arm_pose["pitch"], self.last_arm_pose["yaw"]]
+            quat = R.from_euler('xyz', rpy).as_quat()
+            
             arm_command = RobotCommandBuilder.arm_pose_command(
-                action.get("arm.x", 0.3), # Default reach
-                action.get("arm.y", 0.0), 
-                action.get("arm.z", 0.0),
-                quat[3], quat[0], quat[1], quat[2], # Spot wants [w, x, y, z]
+                self.last_arm_pose["x"], self.last_arm_pose["y"], self.last_arm_pose["z"],
+                quat[3], quat[0], quat[1], quat[2], 
                 GRAV_ALIGNED_BODY_FRAME_NAME,
                 self._VELOCITY_CMD_DURATION_ARM
             )
-
-            gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(
-                action.get("gripper.action", 0.0)
-            )
-
-            command = RobotCommandBuilder.build_synchro_command(
-                base_command, arm_command, gripper_command
-            )
         else:
-            gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(
-                action.get("gripper.action", 0.0)
-            )      
-            command = RobotCommandBuilder.build_synchro_command(base_command,
-                                                                           gripper_command)
+            # If VR trigger is NOT pressed, use the optimized Carry Mode
+            # This prevents the arm from lagging into the Core IO
+            arm_command = RobotCommandBuilder.arm_carry_command()
+
+        gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(
+            action.get("gripper.action", 0.0)
+        )
+
+        command = RobotCommandBuilder.build_synchro_command(
+            base_command, arm_command, gripper_command
+        )
 
         # 5. Send to Robot
         end_time_secs = time.time() + self._VELOCITY_CMD_DURATION
-        self.robot_command_client.robot_command(
+        self.robot_command_client.robot_command_async(
             command=command,
             end_time_secs=end_time_secs
         )
