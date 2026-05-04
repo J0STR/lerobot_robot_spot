@@ -48,6 +48,8 @@ class Spot(Robot):
             "x": 0.3, "y": 0.0, "z": 0.2,
             "roll": 0.0, "pitch": 0.0, "yaw": 0.0 # yaw
         }
+        self.carry_mode = True
+        self.carry_flipped = False
     
     
     def connect(self, calibrate: bool = True) -> None:
@@ -111,6 +113,13 @@ class Spot(Robot):
         base_command = RobotCommandBuilder.synchro_velocity_command(
             v_x=v_x, v_y=v_y, v_rot=v_rot
         )
+
+        # handle activation/deactivation off carry mode
+        if action.get("arm_carry_enabled") and not self.carry_flipped:
+            self.carry_mode = not self.carry_mode
+            self.carry_flipped = True
+        elif not action.get("arm_carry_enabled") and self.carry_flipped:
+            self.carry_flipped = False
         
         if action.get("arm_control"):
             # Update last known pose
@@ -130,10 +139,19 @@ class Spot(Robot):
                 GRAV_ALIGNED_BODY_FRAME_NAME,
                 self._VELOCITY_CMD_DURATION_ARM
             )
-        else:
-            # If VR trigger is NOT pressed, use the optimized Carry Mode
-            # This prevents the arm from lagging into the Core IO
+        elif self.carry_mode:
             arm_command = RobotCommandBuilder.arm_carry_command()
+        else:
+            rpy = [self.last_arm_pose["roll"], self.last_arm_pose["pitch"], self.last_arm_pose["yaw"]]
+            quat = R.from_euler('xyz', rpy).as_quat()
+            
+            arm_command = RobotCommandBuilder.arm_pose_command(
+                self.last_arm_pose["x"], self.last_arm_pose["y"], self.last_arm_pose["z"],
+                quat[3], quat[0], quat[1], quat[2], 
+                GRAV_ALIGNED_BODY_FRAME_NAME,
+                self._VELOCITY_CMD_DURATION_ARM
+            )
+
 
         gripper_command = RobotCommandBuilder.claw_gripper_open_fraction_command(
             action.get("gripper.action", 0.0)
@@ -149,6 +167,8 @@ class Spot(Robot):
             command=command,
             end_time_secs=end_time_secs
         )
+
+        self.carry_last_state = action.get("arm_carry_enabled")
 
         return action
 
